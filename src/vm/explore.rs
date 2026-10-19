@@ -281,12 +281,10 @@ impl<'a> Explorer<'a> {
             task.emu.begin_block();
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
-            // Native continuations also need values carried across single-
-            // predecessor edges. Otherwise scheduling replays a pre-call load
-            // after the call using registers that have already been clobbered.
-            let native_continuation =
-                task.from.is_some() && task.emu.locate_guest_context().is_none();
-            let mut entry_params = if cut_at.contains(&task.id) || native_continuation {
+            // Every continuation needs values carried across edges, including
+            // VM blocks: block-local scheduling cannot replay an earlier load or
+            // treat an older call result as the current physical RAX.
+            let mut entry_params = if cut_at.contains(&task.id) || task.from.is_some() {
                 task.emu.seed_guest_params(block_ref)
             } else {
                 Vec::new()
@@ -305,6 +303,7 @@ impl<'a> Explorer<'a> {
 
             // Locate the context *before* taking the events. The entry block builds the context as it runs, so while those stores were being recorded there was no known VM region to compare them against and they were provisionally tagged as guest accesses.
             task.emu.locate_guest_context();
+            task.emu.refresh_guest_events();
             let events = std::mem::take(&mut task.emu.events);
 
             // Locate the guest register image *before* the terminator is built.

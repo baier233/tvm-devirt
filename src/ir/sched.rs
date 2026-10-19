@@ -919,7 +919,7 @@ fn rename_entry_reads(cfg: &Cfg, blocks: &mut [SchedBlock]) {
         }
 
         let rename = |o: &mut Operand| {
-            if let Operand::Entry(q) | Operand::Param(q) = o {
+            if let Operand::Entry(q) = o {
                 if let Some(&to) = home.get(q) {
                     *o = Operand::Entry(to);
                 }
@@ -1212,11 +1212,13 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
         _ => None,
     };
 
-    // A register still holding a `call_ret` opaque needs no code: that opaque was minted by `clobber_call` to stand for "whatever the callee left here", and the `call` instruction emitted above already establishes exactly that.
+    // A call result is an allocated value, even when passed through at exit.
+    // Subsequent calculations and boundary moves may overwrite physical RAX.
+    // Only genuinely undefined call-clobbered values require no transport.
     let mut exits = Vec::new();
     let mut callee_set = Vec::new();
     for (reg, v) in &b.exit_regs {
-        if matches!(cfg.arena.op(*v), Op::Opaque("call_ret" | "clobbered", _)) {
+        if matches!(cfg.arena.op(*v), Op::Opaque("clobbered", _)) {
             callee_set.push(*reg);
         } else {
             exits.push((*reg, s.value(*v)));
@@ -1234,8 +1236,8 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
     }
 }
 
-fn retarget_stack_args(instrs: &mut [Instr], call_rsp: &[(usize, Option<u64>)], stack_base: u64) {
-    for (i, (call_idx, rsp)) in call_rsp.iter().enumerate() {
+fn retarget_stack_args(instrs: &mut Vec<Instr>, call_rsp: &[(usize, Option<u64>)], stack_base: u64) {
+    for (i, (call_idx, rsp)) in call_rsp.iter().enumerate().rev() {
         // Without a concrete RSP at the call there is nothing to anchor to. Leaving
         // the store entry-relative is wrong, but inventing an offset is worse.
         let Some(rsp) = rsp else { continue };
@@ -1284,12 +1286,17 @@ fn retarget_stack_args(instrs: &mut [Instr], call_rsp: &[(usize, Option<u64>)], 
             continue;
         }
 
-        for (idx, _, at) in candidates {
-            let Instr::Store { addr, disp, .. } = &mut instrs[idx] else {
+        for (idx, _, at) in candidates.into_iter().rev() {
+            let mut outgoing = instrs[idx].clone();
+            let Instr::Store { addr, disp, .. } = &mut outgoing else {
                 continue;
             };
             *addr = Operand::OutArg(at as u32);
             *disp = 0;
+            // The range above shadow space may also contain guest locals (e.g.
+            // a cookie or saved register). Preserve the original location; DSE
+            // can remove it only when no guest read or escaped pointer needs it.
+            instrs.insert(idx + 1, outgoing);
         }
     }
 }
@@ -2572,9 +2579,14 @@ mod tests {
             },
         ];
         retarget_stack_args(&mut instrs, &[(1, Some(call_rsp))], stack_base);
+        assert!(matches!(
+            instrs[0],
+            Instr::Store { addr: Operand::Frame(-0x38), .. }
+        ), "the guest location must remain available to later local reads");
+        assert_eq!(instrs.len(), 3);
         assert!(
             matches!(
-                instrs[0],
+                instrs[1],
                 Instr::Store {
                     addr: Operand::OutArg(0x20),
                     disp: 0,
@@ -2582,7 +2594,7 @@ mod tests {
                 }
             ),
             "entry-0x38 with RSP at entry-0x58 is argument 5, at call_rsp+0x20; got {:?}",
-            instrs[0]
+            instrs[1]
         );
     }
 
@@ -3054,16 +3066,22 @@ mod tests {
             },
         ];
         retarget_stack_args(&mut io_create, &[(3, Some(call_rsp))], stack_base);
-        for (n, ins) in io_create[..3].iter().enumerate() {
+        assert_eq!(io_create.len(), 7);
+        for (n, off) in [-0x38, -0x30, -0x28].into_iter().enumerate() {
+            assert!(matches!(
+                io_create[n * 2],
+                Instr::Store { addr: Operand::Frame(f), .. } if f == off
+            ), "the original guest slot must be preserved");
+            let ins = &io_create[n * 2 + 1];
             assert!(
                 matches!(
                     ins,
                     Instr::Store {
-                        addr: Operand::OutArg(_),
+                        addr: Operand::OutArg(at),
                         ..
-                    }
+                    } if *at == 0x20 + n as u32 * 8
                 ),
-                "store {n} is a genuine stack argument and must be re-anchored to the \
+                "store {n} is a genuine stack argument and must also be copied to the \
                  ABI area; got {ins:?}"
             );
         }

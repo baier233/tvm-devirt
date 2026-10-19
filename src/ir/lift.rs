@@ -581,7 +581,10 @@ impl<'a> Emulator<'a> {
 
     pub fn locate_guest_context(&mut self) -> Option<u64> {
         if let Some(cached) = self.guest_ctx {
-            let (cached_score, _, _) = self.probe_context_at(cached);
+            let (cached_score, cached_rsp_valid, _, cached_layout) = self.probe_best_layout(cached);
+            // The VM can rebuild the same context address using another layout.
+            // Register extraction and stack classification must use one layout.
+            self.guest_layout = Some(cached_layout);
             // The speculative search records a miss when it fails, but falling back to
             // the cached base is a success, so the miss must not be left behind.
             let saved_miss = self.ctx_miss;
@@ -589,7 +592,7 @@ impl<'a> Emulator<'a> {
             self.ctx_miss = saved_miss;
             if let Some(fresh) = found {
                 let (fresh_score, _, _) = self.probe_context_at(fresh);
-                if fresh != cached && fresh_score > cached_score {
+                if fresh != cached && (!cached_rsp_valid || fresh_score > cached_score) {
                     self.guest_ctx = Some(fresh);
                     let (_, _, _, layout) = self.probe_best_layout(fresh);
                     self.guest_layout = Some(layout);
@@ -598,10 +601,14 @@ impl<'a> Emulator<'a> {
             }
             return Some(cached);
         }
-        // Two independent locators. The entry-spill pattern is tried first because it observes the context actually being *built*, which does not depend on where RBP happens to point when evaluation stops.
+        // Prefer the current frame. Historical entry spills can name a context
+        // that has already been overwritten when the VM rebuilt its frame.
         let base = self
-            .context_from_entry_spills()
-            .or_else(|| self.search_guest_context());
+            .search_guest_context()
+            .or_else(|| {
+                let candidate = self.context_from_entry_spills()?;
+                self.probe_best_layout(candidate).1.then_some(candidate)
+            });
         self.guest_ctx = base;
         if let Some(b) = base {
             let (_, _, _, layout) = self.probe_best_layout(b);
@@ -631,6 +638,22 @@ impl<'a> Emulator<'a> {
             }
         }
         self.events = fixed;
+    }
+
+    /// A VM guest stack allocation may only become visible once the handler
+    /// commits its RSP slot. Promote earlier accesses to the newly exposed
+    /// guest locals; do not demote guest effects after a later stack teardown.
+    pub fn refresh_guest_events(&mut self) {
+        let mut events = std::mem::take(&mut self.events);
+        for event in &mut events {
+            if let Event::Store { addr, region, .. } | Event::Load { addr, region, .. } = event {
+                if *region == Region::VmScratch
+                    && self.arena.as_const(*addr).is_some_and(|a| self.region_of_addr(a) == Region::Guest) {
+                    *region = Region::Guest;
+                }
+            }
+        }
+        self.events = events;
     }
 
     /// Locate the guest register image from the entry sequence that fills it. On entry the VM spills every guest register into the context, so the store log contains `Store { addr: k, value: InitReg(r) }` for each register at its own fixed slot.
@@ -710,13 +733,9 @@ impl<'a> Emulator<'a> {
 
     /// Overwrite the guest register image with fresh SSA parameters, returning the parameter for each register. This is what makes a recovered block's expressions independent of the path that reached it.
     ///
-    /// The parameters are deliberately left *unpinned*, even when the slot they
-    /// replace already holds a concrete value. Recovery cuts parameters exactly at
-    /// join blocks -- the ones with more than one predecessor -- so a value read
-    /// here came from whichever single path arrived first, and pinning the
-    /// parameter to it re-binds the block to that path. The block's successors
-    /// then inherit the assertion and compute with it, which is how a fork ends up
-    /// dispatching to an address the VM never reaches.
+    /// Do not pin a new parameter to the value observed on the first predecessor.
+    /// VM continuations also rebase preloaded aliases and existing dispatch path
+    /// constraints; dropping those constraints loses encrypted handler dispatch.
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
         let Some(base) = self.locate_guest_context() else {
             // Mutation-only/native continuations use the machine registers as
@@ -752,8 +771,37 @@ impl<'a> Emulator<'a> {
         };
         let mut out = Vec::new();
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
+        let mut cut = HashMap::new();
+        for reg in layout.order {
+            if *reg == Reg::Rsp { continue; }
+            if let Some(old) = self.read_slot(layout.slot(base, *reg).unwrap()) {
+                if !self.arena.is_const(old) {
+                    let p = self.arena.param(block, *reg);
+                    cut.entry(old).or_insert(p);
+                }
+            }
+        }
+        // VM dispatch can preload operands into interpreter registers or its
+        // private stack. Cutting only the register-image slots leaves those
+        // aliases referencing the predecessor's values.
+        self.invalidate_call_memory();
+        let mut remap = HashMap::new();
+        for root in self.state.symbolic_roots() {
+            remap.insert(root, self.arena.rewrite(root, &cut));
+        }
+        self.state.remap_refs(&remap);
+        for (condition, _) in &mut self.pins {
+            *condition = self.arena.rewrite(*condition, &cut);
+        }
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = 0;
         for (i, reg) in layout.order.iter().enumerate() {
             let addr = base.wrapping_add(layout.first_reg + i as u64 * 8);
+            // RSP is the concrete frame anchor, not an allocated guest value.
+            if *reg == Reg::Rsp {
+                continue;
+            }
             let p = self.arena.param(block, *reg);
             self.state.store_concrete(&self.arena, addr, p, Width::W64);
             out.push((*reg, p));
