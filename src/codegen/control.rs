@@ -493,6 +493,13 @@ pub(crate) fn emit_branch_jcc(
 ) -> Result<()> {
     let end = b.instrs.len();
     if let Some(ctrl) = &b.control {
+        if let Operand::Imm(value) = ctrl {
+            let target = if *value != 0 { taken_lbl } else { not_taken_lbl };
+            if let Some(label) = target {
+                asm.jmp(label)?;
+            }
+            return Ok(());
+        }
         // The comparison, if any, was recorded by dead-code elimination when it removed the instruction that defined it.
         if let Some(fc) = &b.fused_cmp {
             emit_cmp(asm, alloc, &fc.a, &fc.b, fc.width, end, layout, &[])?;
@@ -511,12 +518,23 @@ pub(crate) fn emit_branch_jcc(
             // Generic: test the control value and jump if non-zero.
             let ctrl_r = match resolve(alloc, ctrl, end) {
                 Some(Loc::Reg(r)) => r,
-                _ => {
+                Some(Loc::Spill(slot)) => {
+                    // A spilled predicate remains conditional. Preserve the
+                    // scratch register, since successors may expect its value.
+                    let save = layout.scratch_slot_disp(3) as i32;
+                    asm.mov(qword_ptr(rsp + save), r11)?;
+                    asm.mov(r11, qword_ptr(rsp + layout.spill_disp(slot) as i32))?;
+                    emit_test_self(asm, Reg::R11, control_width(b, ctrl))?;
+                    asm.mov(r11, qword_ptr(rsp + save))?;
                     if let Some(lbl) = taken_lbl {
+                        asm.jne(lbl)?;
+                    }
+                    if let Some(lbl) = not_taken_lbl {
                         asm.jmp(lbl)?;
                     }
                     return Ok(());
                 }
+                None => bail!("branch predicate has no allocated location: {ctrl:?}"),
             };
             emit_test_self(asm, ctrl_r, control_width(b, ctrl))?;
             if let Some(lbl) = taken_lbl {

@@ -341,6 +341,7 @@ pub(crate) fn iced_of_reg(r: Reg) -> iced_x86::Register {
         Reg::R13 => iced_x86::Register::R13,
         Reg::R14 => iced_x86::Register::R14,
         Reg::R15 => iced_x86::Register::R15,
+        Reg::Flags => unreachable!("flags have no physical GPR"),
     }
 }
 
@@ -555,6 +556,19 @@ pub(crate) fn emit_instr(
         }
 
         Instr::Call { target, args } => {
+            if let CallTarget::Indirect(op) = target
+                && !matches!(op, Operand::Imm(_))
+            {
+                // Argument setup may overwrite the register holding the target.
+                // Snapshot it in private storage before the parallel assignment.
+                let disp = layout.scratch_slot_disp(3);
+                let off = disp - layout.frame_size as i64;
+                emit_store(asm, alloc, &Operand::Frame(off), op, 0,
+                    Width::W64, pos, layout, img)?;
+                emit_call_args(asm, alloc, args, pos, layout)?;
+                asm.call(qword_ptr(rsp + disp as i32))?;
+                return Ok(());
+            }
             emit_call_args(asm, alloc, args, pos, layout)?;
             emit_call(asm, alloc, target, pos, img, layout, redirect)?;
         }
@@ -1074,18 +1088,25 @@ pub(crate) fn emit_bin_into(
 
     // Pick a scratch for `b` that does not overlap the destination, RSP, or the
     // register currently holding `a`.
-    let scratch = alloc
-        .free_volatile_at(pos, &{
-            match a_loc {
-                Some(Loc::Reg(r)) => vec![dst_r, Reg::Rsp, r],
-                _ => vec![dst_r, Reg::Rsp],
-            }
-        })
-        .unwrap_or(if dst_r != Reg::Rax {
-            Reg::Rax
-        } else {
-            Reg::Rcx
-        });
+    let free_scratch = alloc.free_volatile_at(pos, &{
+        match a_loc {
+            Some(Loc::Reg(r)) => vec![dst_r, Reg::Rsp, r],
+            _ => vec![dst_r, Reg::Rsp],
+        }
+    });
+    let scratch = free_scratch.unwrap_or(if dst_r != Reg::Rax {
+        Reg::Rax
+    } else {
+        Reg::Rcx
+    });
+    if free_scratch.is_none() {
+        // Register pressure must not make loading the second operand destroy a
+        // live entry/computed value. Slots 0 and 1 can already be in use above.
+        asm.mov(
+            qword_ptr(rsp + layout.scratch_slot_disp(2) as i32),
+            qreg(scratch),
+        )?;
+    }
 
     // Read `b` from wherever it ended up: the relocation above, or its own home.
     let read_b = |asm: &mut CodeAssembler| -> Result<Reg> {
@@ -1192,6 +1213,12 @@ pub(crate) fn emit_bin_into(
         }
     }
 
+    if free_scratch.is_none() {
+        asm.mov(
+            qreg(scratch),
+            qword_ptr(rsp + layout.scratch_slot_disp(2) as i32),
+        )?;
+    }
     // Put back a register borrowed to hold `b`. The result is in `dst_r`, which is
     // never the borrowed register, so this cannot overwrite it. `mov` leaves flags
     // alone, so a `setcc` result computed above survives.
@@ -1804,6 +1831,10 @@ pub(crate) fn emit_call(
             }
         }
         CallTarget::Indirect(op) => {
+            if let Operand::Imm(address) = op {
+                asm.call(redirect.resolve(*address))?;
+                return Ok(());
+            }
             // Prefer the allocated register and reload spilled targets through R11.
             match resolve(alloc, op, pos) {
                 Some(Loc::Reg(r)) => asm.call(qreg(r))?,
@@ -1813,11 +1844,11 @@ pub(crate) fn emit_call(
                     asm.mov(r11, qword_ptr(rsp + layout.spill_disp(i) as i32))?;
                     asm.call(r11)?
                 }
-                None => asm.int3()?,
+                None => bail!("indirect call target has no allocated location: {op:?}"),
             }
         }
-        CallTarget::Unknown { .. } => {
-            asm.int3()?;
+        CallTarget::Unknown { site } => {
+            bail!("unresolved call target at {site:#x}");
         }
     }
     Ok(())

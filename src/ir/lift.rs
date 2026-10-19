@@ -719,7 +719,36 @@ impl<'a> Emulator<'a> {
     /// dispatching to an address the VM never reaches.
     pub fn seed_guest_params(&mut self, block: crate::ir::expr::BlockRef) -> Vec<(Reg, Ref)> {
         let Some(base) = self.locate_guest_context() else {
-            return Vec::new();
+            // Mutation-only/native continuations use the machine registers as
+            // guest state. They need PHIs too: retaining the first predecessor's
+            // BL=0 used to erase the other predecessor's enabled action.
+            self.pins.clear();
+            self.subst_memo.clear();
+            self.pin_dep.clear();
+            self.memo_pin_count = 0;
+            self.invalidate_call_memory();
+            let mut out = Vec::new();
+            for reg in crate::ir::expr::GPRS {
+                if reg == Reg::Rsp {
+                    continue;
+                }
+                // Keep an established frame pointer concrete for stack layout.
+                if reg == Reg::Rbp
+                    && self.arena.as_const(self.state.reg(reg)).is_some_and(|v| {
+                        v <= self.stack_base
+                            && v >= self.stack_base.saturating_sub(GUEST_FRAME_WINDOW)
+                    })
+                {
+                    continue;
+                }
+                let p = self.arena.param(block, reg);
+                self.state.set_reg(reg, p);
+                out.push((reg, p));
+            }
+            let flags = self.arena.param(block, Reg::Flags);
+            self.state.unpack_flags(&mut self.arena, flags);
+            out.push((Reg::Flags, flags));
+            return out;
         };
         let mut out = Vec::new();
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
@@ -978,17 +1007,15 @@ impl<'a> Emulator<'a> {
         if let Some(a) = self.arena.as_const(addr) {
             // Do not fold a read from a writable section. The loader or runtime may write a different value there before the code runs, so the file content is a placeholder rather than the real value.
             let writable = self.pe.is_writable(a);
-            // BSS (uninitialized data) is an exception: it is in a writable section but is zero-initialized by the loader, so we can fold it to zero at load time.
-            let is_bss = self.pe.is_bss(a);
             // An IAT slot is not writable by its section bits but *is* rewritten by the
             // loader, so it must be refused for the same reason a `.data` global is.
             let bound = self.pe.is_loader_bound(a, width.bytes() as u64);
             let pe = self.pe;
             let arena = &mut self.arena;
             let img = |x: u64| pe.image_u8(x);
-            // Fold if: (not writable OR is BSS) AND not loader-bound
-            // BSS is writable but we know it's zero at load time
-            if (!writable || is_bss) && !bound {
+            // Recovery may start at a callback long after initialization. BSS is
+            // only zero at image load time, not at arbitrary function entry.
+            if !writable && !bound {
                 if let Some(v) = self.state.load_concrete(arena, a, width, img) {
                     return v;
                 }
@@ -1098,8 +1125,7 @@ impl<'a> Emulator<'a> {
     /// image, under the same rule the concrete load path applies: never fold a read
     /// from a section the loader or the runtime may have rewritten.
     fn image_load(&mut self, addr: u64, width: Width) -> Option<Ref> {
-        let is_bss = self.pe.is_bss(addr);
-        if self.pe.is_writable(addr) && !is_bss {
+        if self.pe.is_writable(addr) {
             return None;
         }
         if self.pe.is_loader_bound(addr, width.bytes() as u64) {
@@ -1938,10 +1964,13 @@ impl<'a> Emulator<'a> {
                         }
                     }
                 }
-                let target = disasm::direct_target(&inst).or_else(|| {
-                    let d = self.read_op(&inst, 0);
-                    self.arena.as_const(d)
-                });
+                let target_expr = if let Some(address) = disasm::direct_target(&inst) {
+                    self.arena.constant(address, Width::W64)
+                } else {
+                    let value = self.read_op(&inst, 0);
+                    self.substitute(value)
+                };
+                let target = self.arena.as_const(target_expr);
                 // A target that is not executable code was never a callee: it is an
                 // unbound import entry or a misfolded value. Discarding it keeps the
                 // event honest instead of naming a bogus address.
@@ -1954,7 +1983,10 @@ impl<'a> Emulator<'a> {
                 }
                 // Guest call: record it, skip over it, and mark the volatile
                 // register set as clobbered per the Windows x64 ABI.
-                let t = target.map(|t| self.arena.constant(t, Width::W64));
+                // An indirect callee is a runtime expression, not a failed
+                // constant lookup. Preserve it before clobbering call state.
+                let t = target.map(|t| self.arena.constant(t, Width::W64))
+                    .or_else(|| (!self.arena.is_const(target_expr)).then_some(target_expr));
                 let rsp = self.state.concrete_rsp(&self.arena);
                 // Keep arguments explicitly established by this run before applying
                 // ABI clobbers.
@@ -2163,9 +2195,7 @@ impl<'a> Emulator<'a> {
                     let w = self.arena.width(r);
                     // Re-attempt resolution against image/abstract memory now that the address may have become concrete. This must not go through `load`, which records events: substitution is a pure rewrite and may be run many times over the same node.
                     if let Some(c) = self.arena.as_const(a) {
-                        let is_bss = self.pe.is_bss(c);
-                        if (!self.pe.is_writable(c) || is_bss)
-                            && !self.pe.is_loader_bound(c, w.bytes() as u64)
+                        if !self.pe.is_writable(c) && !self.pe.is_loader_bound(c, w.bytes() as u64)
                         {
                             let pe = self.pe;
                             let img = |x: u64| pe.image_u8(x);
@@ -2571,6 +2601,7 @@ impl<'a> Emulator<'a> {
     /// Clobber the volatile registers a call destroys, returning the `call_ret`
     /// opaque left in RAX so the caller can record it on the event.
     fn clobber_call(&mut self) -> Option<Ref> {
+        self.invalidate_call_memory();
         let mut ret = None;
         for r in [
             Reg::Rax,
@@ -2597,6 +2628,27 @@ impl<'a> Emulator<'a> {
         self.written_args.clear();
         self.clobber_arith_flags();
         ret
+    }
+
+    /// A guest call may write through output parameters or previously escaped
+    /// pointers. Keeping pre-call byte values silently folds those outputs back
+    /// to their initializers (for example, an MDL output stays NULL forever).
+    /// Preserve interpreter-private scratch, but forget guest memory without
+    /// guessing an output buffer size. The call event models the actual write;
+    /// subsequent guest loads must fetch the runtime values.
+    fn invalidate_call_memory(&mut self) {
+        let forgotten: Vec<u64> = self
+            .state
+            .mem
+            .keys()
+            .copied()
+            .filter(|a| !self.is_vm_scratch(*a))
+            .collect();
+        for a in forgotten {
+            self.state.mem.remove(&a);
+        }
+        self.arena.bump_mem_gen();
+        self.arena.note_symbolic_store();
     }
 
     /// Reclaim unreachable expression history and update every retained ref.
@@ -3277,6 +3329,175 @@ mod compaction_tests {
         assert_eq!(
             emu.arena.op(retained[0]),
             &Op::Param(BlockRef(11), Reg::R12)
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_effect_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+    use iced_x86::code_asm::*;
+
+    const BASE: u64 = 0x140000000;
+    const START: u64 = BASE + 0x1000;
+    const STACK: u64 = 0x7fffffff0000;
+
+    fn image(code: &[u8]) -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        data[0x280] = 0xc3;
+        PeFile {
+            data,
+            image_base: BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x3000,
+            sections: vec![
+                Section {
+                    name: ".text".into(),
+                    virtual_address: 0x1000,
+                    virtual_size: 0x100,
+                    raw_address: 0x200,
+                    raw_size: 0x100,
+                    characteristics: 0x60000020,
+                },
+                Section {
+                    name: ".bss".into(),
+                    virtual_address: 0x2000,
+                    virtual_size: 0x100,
+                    raw_address: 0,
+                    raw_size: 0,
+                    characteristics: 0xc0000080,
+                },
+            ],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: vec![],
+        }
+    }
+
+    #[test]
+    fn callback_branch_on_bss_is_not_folded_to_initial_zero() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut done = a.create_label();
+        a.mov(rax, BASE + 0x2000).unwrap();
+        a.cmp(byte_ptr(rax), 0).unwrap();
+        a.je(done).unwrap();
+        a.mov(eax, 1).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.ret().unwrap();
+        let pe = image(&a.assemble(START).unwrap());
+        assert!(pe.is_bss(BASE + 0x2000));
+        let mut emu = Emulator::new(&pe, STACK);
+        assert!(matches!(emu.run(START, 100), Stop::NativeBranch { .. }));
+    }
+
+    #[test]
+    fn callee_output_can_change_a_zero_initialized_stack_slot() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut done = a.create_label();
+        a.sub(rsp, 0x28).unwrap();
+        a.mov(qword_ptr(rsp + 0x20), 0).unwrap();
+        a.lea(r8, ptr(rsp + 0x20)).unwrap();
+        a.call(START + 0x80).unwrap();
+        a.cmp(qword_ptr(rsp + 0x20), 0).unwrap();
+        a.je(done).unwrap();
+        a.mov(eax, 1).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.add(rsp, 0x28).unwrap();
+        a.ret().unwrap();
+        let pe = image(&a.assemble(START).unwrap());
+        let mut emu = Emulator::new(&pe, STACK);
+        assert!(matches!(emu.run(START, 100), Stop::NativeBranch { .. }));
+        assert!(emu.events.iter().any(|e| matches!(
+            e,
+            Event::Load {
+                region: Region::Guest,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unchanged_local_without_a_call_still_folds() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut done = a.create_label();
+        a.sub(rsp, 0x28).unwrap();
+        a.mov(qword_ptr(rsp + 0x20), 0).unwrap();
+        a.cmp(qword_ptr(rsp + 0x20), 0).unwrap();
+        a.je(done).unwrap();
+        a.ud2().unwrap();
+        a.set_label(&mut done).unwrap();
+        a.add(rsp, 0x28).unwrap();
+        a.ret().unwrap();
+        let pe = image(&a.assemble(START).unwrap());
+        let mut emu = Emulator::new(&pe, STACK);
+        assert!(matches!(emu.run(START, 100), Stop::Return { .. }));
+    }
+
+    #[test]
+    fn native_join_preserves_the_predecessor_that_enables_an_action() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut enabled = a.create_label();
+        let mut join = a.create_label();
+        let mut gate = a.create_label();
+        let mut done = a.create_label();
+        a.test(ecx, ecx).unwrap();
+        a.je(enabled).unwrap();
+        a.xor(ebx, ebx).unwrap();
+        a.jmp(join).unwrap();
+        a.set_label(&mut enabled).unwrap();
+        a.mov(ebx, 1).unwrap();
+        a.set_label(&mut join).unwrap();
+        a.test(edx, edx).unwrap();
+        a.je(gate).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut gate).unwrap();
+        a.test(bl, bl).unwrap();
+        a.je(done).unwrap();
+        a.call(START + 0x80).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.ret().unwrap();
+        let pe = image(&a.assemble(START).unwrap());
+        let cfg = crate::vm::explore::Explorer::new(&pe, STACK).recover(START);
+        assert!(cfg.blocks.iter().flat_map(|b| &b.events).any(|e| {
+            matches!(e, Event::Call { target: Some(t), .. } if cfg.arena.as_const(*t) == Some(START + 0x80))
+        }), "the first predecessor's BL=0 erased the enabled branch");
+    }
+
+    #[test]
+    fn native_flag_merge_uses_scoped_parameters() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut right = a.create_label();
+        let mut join = a.create_label();
+        let mut carry = a.create_label();
+        a.test(ecx, ecx).unwrap();
+        a.je(right).unwrap();
+        a.cmp(edx, 5).unwrap();
+        a.jmp(join).unwrap();
+        a.set_label(&mut right).unwrap();
+        a.cmp(edx, 10).unwrap();
+        a.set_label(&mut join).unwrap();
+        a.jb(carry).unwrap();
+        a.pushfq().unwrap();
+        a.pop(rax).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut carry).unwrap();
+        a.pushfq().unwrap();
+        a.pop(rax).unwrap();
+        a.ret().unwrap();
+        let pe = image(&a.assemble(START).unwrap());
+        let cfg = crate::vm::explore::Explorer::new(&pe, STACK).recover(START);
+        assert_eq!(cfg.unresolved, 0);
+        let issues = crate::vm::explore::validate(&cfg);
+        assert!(issues.is_clean(), "{}", issues.summary());
+        assert!(
+            cfg.blocks
+                .iter()
+                .any(|b| b.preds.len() > 1 && b.params.iter().any(|(r, _)| *r == Reg::Flags))
         );
     }
 }

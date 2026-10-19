@@ -30,6 +30,7 @@ pub(crate) fn qreg(r: Reg) -> AsmRegister64 {
         R13 => r13,
         R14 => r14,
         R15 => r15,
+        Flags => unreachable!("flags have no physical GPR"),
     }
 }
 
@@ -52,6 +53,7 @@ pub(crate) fn dreg(r: Reg) -> AsmRegister32 {
         R13 => r13d,
         R14 => r14d,
         R15 => r15d,
+        Flags => unreachable!("flags have no physical GPR"),
     }
 }
 
@@ -75,6 +77,7 @@ pub(crate) fn wreg(r: Reg) -> AsmRegister16 {
         R13 => r13w,
         R14 => r14w,
         R15 => r15w,
+        Flags => unreachable!("flags have no physical GPR"),
     }
 }
 
@@ -97,6 +100,7 @@ pub(crate) fn breg(r: Reg) -> AsmRegister8 {
         R13 => r13b,
         R14 => r14b,
         R15 => r15b,
+        Flags => unreachable!("flags have no physical GPR"),
     }
 }
 

@@ -76,6 +76,8 @@ pub enum Reg {
     R13,
     R14,
     R15,
+    /// Packed native status flags, transported in a private frame slot.
+    Flags,
 }
 
 pub const GPRS: [Reg; 16] = [
@@ -116,6 +118,7 @@ impl Reg {
             Reg::R13 => "r13",
             Reg::R14 => "r14",
             Reg::R15 => "r15",
+            Reg::Flags => "flags",
         }
     }
 }

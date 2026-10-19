@@ -427,9 +427,13 @@ fn prepare_one(
     ex.time_budget = std::time::Duration::from_secs(timeout_secs);
 
     let cfg = ex.recover(entry.vm_entry_va);
-    let blocks = sched::schedule(&cfg);
     let entry_va = entry.trampoline_va;
     let incomplete = why_incomplete(&cfg);
+    let blocks = if incomplete.is_none() {
+        sched::schedule(&cfg)
+    } else {
+        Vec::new()
+    };
     let allocs: Vec<regalloc::Alloc> = blocks.iter().map(regalloc::allocate).collect();
 
     PreparedFn {
@@ -442,7 +446,7 @@ fn prepare_one(
 }
 
 /// Why a recovered graph cannot be retargeted, or `None` when it can.
-fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
+pub(crate) fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
     if cfg.blocks.is_empty() {
         return Some("no blocks recovered".to_string());
     }

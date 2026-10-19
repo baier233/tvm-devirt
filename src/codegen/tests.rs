@@ -42,10 +42,9 @@ fn emit_one(instr: &Instr, segs: Vec<Segment>) -> Vec<String> {
     out
 }
 
-/// Verify that an adjacent scratch restore/save pair is removed while the reversed
-/// store/load pair is retained.
+/// The restore defines RAX; only the following save is redundant.
 #[test]
-fn adjacent_restore_then_save_of_same_slot_and_register_is_removed() {
+fn adjacent_restore_then_save_keeps_the_register_definition() {
     let base: u64 = 0x1000;
     let mut asm = CodeAssembler::new(64).expect("asm");
     // restore: mov rax, [rsp+0x108]
@@ -64,11 +63,16 @@ fn adjacent_restore_then_save_of_same_slot_and_register_is_removed() {
     assert_eq!(bytes.len(), 16, "two 8-byte instructions");
     let out = optimize_frame_traffic(bytes, base).expect("optimize");
     assert!(
-        out.is_empty(),
-        "both instructions should be gone, got {} bytes: {:?}",
+        out == bytes_for_restore(),
+        "the restore must survive, got {} bytes: {:?}",
         out.len(),
         disasm_bytes(&out, base)
     );
+    fn bytes_for_restore() -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(rax, qword_ptr(rsp + 0x108_i32)).unwrap();
+        a.assemble(0x1000).unwrap()
+    }
 }
 
 /// Reversed order: store then load. That is a real value transfer (slot ← rax,

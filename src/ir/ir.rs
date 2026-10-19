@@ -1,5 +1,5 @@
-//! The recovered control-flow graph: the IR every later stage consumes. 
-//! Separated from the recovery engine because the two have different audiences. 
+//! The recovered control-flow graph: the IR every later stage consumes.
+//! Separated from the recovery engine because the two have different audiences.
 //! [`crate::vm::explore`] is the only thing that builds a [`Cfg`]; scheduling, register allocation, lowering and writeback only read one.
 
 use crate::ir::expr::{self, Arena, Ref};
@@ -176,7 +176,11 @@ impl Cfg {
                 // value at all is left alone: that means every predecessor failed
                 // to recover, and inventing a value would be a lie.
                 if let [only] = vals[..] {
-                    if only != phi.param {
+                    // The scheduler is block-local. Substituting a predecessor's
+                    // load/call result would evaluate it again in the successor,
+                    // after memory or physical argument registers have changed.
+                    // Constants are safe to rematerialize across this boundary.
+                    if only != phi.param && self.arena.is_const(only) {
                         map.insert(phi.param, only);
                     }
                 }

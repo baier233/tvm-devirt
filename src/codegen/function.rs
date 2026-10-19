@@ -60,7 +60,7 @@ pub(crate) fn saved_registers(blocks: &[SchedBlock], allocs: &[Alloc]) -> Vec<Re
     .collect()
 }
 
-/// Mark adjacent scratch restore/save pairs that cancel out.
+/// Remove the redundant save in an adjacent scratch restore/save pair.
 ///
 /// Pairs at branch targets are retained because control may enter between them.
 pub(crate) fn mark_scratch_roundtrips(
@@ -102,9 +102,12 @@ pub(crate) fn mark_scratch_roundtrips(
 
         if let Some((p_idx, p_reg, p_disp)) = prev_restore {
             if as_save && ins.op1_register() == p_reg && ins.memory_displacement64() == p_disp {
-                dead[p_idx] = true;
+                // The restore still defines the register read by the following
+                // operation. Removing both makes that operation read the prior
+                // scratch result instead of its allocated operand.
+                let _ = p_idx;
                 dead[i] = true;
-                killed += 2;
+                killed += 1;
                 prev_restore = None;
                 continue;
             }
@@ -525,6 +528,20 @@ pub fn emit_function_full(
         }
 
         // Boundary moves and terminator.
+        if let Some((_, flags)) = b.exits.iter().find(|(r, _)| *r == Reg::Flags) {
+            let off = layout.spill_disp(0) - layout.frame_size as i64;
+            emit_store(
+                &mut asm,
+                alloc,
+                &Operand::Frame(off),
+                flags,
+                0,
+                Width::W64,
+                b.instrs.len(),
+                &layout,
+                img,
+            )?;
+        }
         let moves = regalloc::reconcile(b, alloc);
         emit_terminator(
             &mut asm, alloc, b, &moves, &label_of, &layout, next_id, redirect,

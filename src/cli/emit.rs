@@ -121,6 +121,9 @@ pub fn cmd_devirt(
         cfg.total_steps,
     );
 
+    if let Some(reason) = writeback::why_incomplete(&cfg) {
+        anyhow::bail!("refusing to emit incomplete function: {reason}");
+    }
     let sched_blocks = sched::schedule(&cfg);
     let allocs: Vec<regalloc::Alloc> = sched_blocks.iter().map(regalloc::allocate).collect();
 

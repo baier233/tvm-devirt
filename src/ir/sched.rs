@@ -293,7 +293,22 @@ impl<'a> Scheduler<'a> {
                     owner, self.block,
                     "scheduling a foreign block's parameter; SSA scoping is violated"
                 );
-                Operand::Param(reg)
+                if reg == Reg::Flags {
+                    // Snapshot the incoming slot before its boundary store.
+                    // All consumers (including other exits and the terminator)
+                    // read this allocated value, never the overwritten slot.
+                    let dst = self.fresh();
+                    self.instrs.push(Instr::Cast {
+                        dst,
+                        kind: CastKind::Zext,
+                        a: Operand::Param(reg),
+                        from: Width::W64,
+                        to: Width::W64,
+                    });
+                    Operand::Val(dst)
+                } else {
+                    Operand::Param(reg)
+                }
             }
             Op::Opaque(tag, _) => {
                 // A `call_ret` reaching here was not produced by any call in this block: the call path below places its opaque directly, so a block-local return value is already in `placed` and never arrives here.

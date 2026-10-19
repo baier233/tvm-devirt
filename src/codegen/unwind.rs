@@ -75,6 +75,7 @@ pub(crate) fn unwind_reg_code(r: Reg) -> u8 {
         Reg::R13 => 13,
         Reg::R14 => 14,
         Reg::R15 => 15,
+        Reg::Flags => unreachable!("private flags slot is not an unwind register"),
     }
 }
 

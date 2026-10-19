@@ -209,6 +209,7 @@ pub(crate) fn ireg(r: Reg, w: Width) -> iced_x86::Register {
         (R15, Width::W32) => R::R15D,
         (R15, Width::W16) => R::R15W,
         (R15, Width::W8) => R::R15L,
+        (Flags, _) => unreachable!("flags have no physical GPR"),
     }
 }
 

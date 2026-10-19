@@ -151,7 +151,7 @@ impl<'a> Explorer<'a> {
             let mut probe = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
             probe.discover_vip_slot(start, Self::VIP_PROBE_STEPS)
         };
-        let first = self.recover_pass(start, &HashSet::new(), vip_slot);
+        let mut first = self.recover_pass(start, &HashSet::new(), vip_slot);
         let joins: HashSet<BlockId> = first
             .blocks
             .iter()
@@ -159,6 +159,8 @@ impl<'a> Explorer<'a> {
             .map(|b| b.id)
             .collect();
         if joins.is_empty() {
+            first.trivial_phis_removed = first.simplify_phis();
+            first.remove_dead_params();
             return first;
         }
         let mut cfg = self.recover_pass_with(start, &joins, Some(&first), vip_slot);
@@ -279,7 +281,12 @@ impl<'a> Explorer<'a> {
             task.emu.begin_block();
             // Replace the guest register image with this block's SSA parameters before any of its instructions run, so everything the block computes is expressed in terms of its own entry state rather than reaching back to function entry through whichever single path got here.
             let block_ref = expr::BlockRef(blocks.len() as u32);
-            let mut entry_params = if cut_at.contains(&task.id) {
+            // Native continuations also need values carried across single-
+            // predecessor edges. Otherwise scheduling replays a pre-call load
+            // after the call using registers that have already been clobbered.
+            let native_continuation =
+                task.from.is_some() && task.emu.locate_guest_context().is_none();
+            let mut entry_params = if cut_at.contains(&task.id) || native_continuation {
                 task.emu.seed_guest_params(block_ref)
             } else {
                 Vec::new()
@@ -458,6 +465,11 @@ impl<'a> Explorer<'a> {
             }
 
             let from_vm_context = guest.is_some();
+            let native_flags = if !from_vm_context && !returning {
+                Some(task.emu.state.pack_flags(&mut task.emu.arena))
+            } else {
+                None
+            };
             let src = &task.emu.arena;
             let mut exit_regs: Vec<(crate::ir::expr::Reg, Ref)> = match guest {
                 Some(regs) => regs
@@ -472,6 +484,9 @@ impl<'a> Explorer<'a> {
                     })
                     .collect(),
             };
+            if let Some(flags) = native_flags {
+                exit_regs.push((expr::Reg::Flags, arena.graft(src, flags, &mut memo)));
+            }
             exit_regs.sort_by_key(|(r, _)| *r as u8);
 
             // Read the continuation target before the terminator is moved.
@@ -1370,6 +1385,15 @@ pub fn validate(cfg: &Cfg) -> CfgIssues {
                         .and_then(|oid| dom.get(&b.id).map(|d| d.contains(oid)))
                         .unwrap_or(false);
                     if !dominates {
+                        if std::env::var_os("TVM_CFG_DIAGNOSTICS").is_some() {
+                            eprintln!(
+                                "non-dominating parameter: block={:?} root={:?} leaf={:?} owner={:?}",
+                                b.id,
+                                cfg.arena.op(r),
+                                cfg.arena.op(leaf),
+                                owner_of.get(owner)
+                            );
+                        }
                         issues.nondominating_params.push((b.id, *owner));
                     }
                     used.insert(leaf);

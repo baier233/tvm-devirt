@@ -1,4 +1,4 @@
-//! Register allocation over scheduled blocks. 
+//! Register allocation over scheduled blocks.
 
 use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, OpAccess};
 use std::collections::{HashMap, HashSet};
@@ -54,7 +54,7 @@ pub struct Interval {
 /// A mask rather than a `Vec` so `Interval` and `Range` stay `Copy`, which the
 /// allocator's range list relies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RegSet(u16);
+pub struct RegSet(u32);
 
 impl RegSet {
     pub const EMPTY: RegSet = RegSet(0);
@@ -603,10 +603,21 @@ pub fn allocate(b: &SchedBlock) -> Alloc {
     let mut alloc = Alloc::default();
     let mut busy: HashMap<Reg, Range> = HashMap::new();
     // Spill slot -> the range occupying it, so slots can be reused.
-    let mut slot_of: Vec<Option<Range>> = Vec::new();
+    // Slot zero is shared across blocks for the packed native flags. Ordinary
+    // spills never reuse it, including in blocks that do not read flags.
+    let mut slot_of: Vec<Option<Range>> = vec![None];
 
     for r in work.iter().filter(|r| r.fixed.is_some()) {
         let reg = r.fixed.expect("filtered on fixed");
+        if reg == Reg::Flags {
+            alloc.segments.push(Segment {
+                item: r.item,
+                start: r.def,
+                end: r.last_use,
+                loc: Loc::Spill(0),
+            });
+            continue;
+        }
         busy.insert(reg, *r);
         alloc.segments.push(Segment {
             item: r.item,
@@ -617,7 +628,7 @@ pub fn allocate(b: &SchedBlock) -> Alloc {
     }
 
     let take_slot = |r: &Range, slots: &mut Vec<Option<Range>>| -> Loc {
-        for (i, occupant) in slots.iter_mut().enumerate() {
+        for (i, occupant) in slots.iter_mut().enumerate().skip(1) {
             if occupant.is_none_or(|h| h.last_use <= r.def) {
                 *occupant = Some(*r);
                 return Loc::Spill(i as u32);
@@ -799,6 +810,9 @@ pub fn reconcile(b: &SchedBlock, a: &Alloc) -> Vec<Move> {
     // Pending moves as (dst, source), dropping the ones already satisfied.
     let mut pending: Vec<(Reg, Src)> = Vec::new();
     for (reg, op) in &b.exits {
+        if *reg == Reg::Flags {
+            continue; // Committed to its private slot by the function emitter.
+        }
         let src = match op {
             Operand::Imm(v) => Src::Imm(*v),
             // A stack address is computed into the destination rather than copied
